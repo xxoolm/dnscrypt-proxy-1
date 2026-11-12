@@ -6,21 +6,21 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/bits"
 	"math/rand"
 	"net"
-	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/VividCortex/ewma"
 	"github.com/jedisct1/dlog"
+	clocksmith "github.com/jedisct1/go-clocksmith"
 	stamps "github.com/jedisct1/go-dnsstamps"
-	"github.com/miekg/dns"
 	"golang.org/x/crypto/ed25519"
 )
 
@@ -60,14 +60,24 @@ type ServerInfo struct {
 	ServerPk           [32]byte
 	SharedKey          [32]byte
 	MagicQuery         [8]byte
+	PqPublicKey        []byte
+	PqCertContext      []byte
+	pqSession          *pqSessionState
 	knownBugs          ServerBugs
 	Proto              stamps.StampProtoType
 	useGet             bool
-	odohTargets        []ODoHTarget
+	odohTargetConfigs  []ODoHTargetConfig
+
+	// WP2 strategy fields
+	totalQueries   uint64    // Total queries sent to this server
+	failedQueries  uint64    // Failed queries count
+	lastUpdateTime time.Time // Last time metrics were updated
+	lastDecayTS    time.Time // Last time RTT was decayed for recovery
 }
 
 type LBStrategy interface {
 	getCandidate(serversCount int) int
+	getActiveCount(serversCount int) int
 }
 
 type LBStrategyP2 struct{}
@@ -76,16 +86,28 @@ func (LBStrategyP2) getCandidate(serversCount int) int {
 	return rand.Intn(Min(serversCount, 2))
 }
 
+func (LBStrategyP2) getActiveCount(serversCount int) int {
+	return Min(serversCount, 2)
+}
+
 type LBStrategyPN struct{ n int }
 
 func (s LBStrategyPN) getCandidate(serversCount int) int {
 	return rand.Intn(Min(serversCount, s.n))
 }
 
+func (s LBStrategyPN) getActiveCount(serversCount int) int {
+	return Min(serversCount, s.n)
+}
+
 type LBStrategyPH struct{}
 
 func (LBStrategyPH) getCandidate(serversCount int) int {
-	return rand.Intn(Max(Min(serversCount, 2), serversCount/2))
+	return rand.Intn((serversCount + 1) / 2)
+}
+
+func (LBStrategyPH) getActiveCount(serversCount int) int {
+	return (serversCount + 1) / 2
 }
 
 type LBStrategyFirst struct{}
@@ -94,13 +116,36 @@ func (LBStrategyFirst) getCandidate(int) int {
 	return 0
 }
 
+func (LBStrategyFirst) getActiveCount(int) int {
+	return 1
+}
+
 type LBStrategyRandom struct{}
 
 func (LBStrategyRandom) getCandidate(serversCount int) int {
 	return rand.Intn(serversCount)
 }
 
-var DefaultLBStrategy = LBStrategyP2{}
+func (LBStrategyRandom) getActiveCount(serversCount int) int {
+	return serversCount
+}
+
+type LBStrategyWP2 struct{}
+
+func (LBStrategyWP2) getCandidate(serversCount int) int {
+	// This function is not used for WP2 - getWeightedCandidate is used instead
+	// But we need to implement it to satisfy the LBStrategy interface
+	if serversCount <= 1 {
+		return 0
+	}
+	return rand.Intn(serversCount)
+}
+
+func (LBStrategyWP2) getActiveCount(serversCount int) int {
+	return serversCount // All servers are considered active for WP2
+}
+
+var DefaultLBStrategy = LBStrategyWP2{}
 
 type DNSCryptRelay struct {
 	RelayUDPAddr *net.UDPAddr
@@ -108,26 +153,94 @@ type DNSCryptRelay struct {
 }
 
 type ODoHRelay struct {
-	url *url.URL
+	URL *url.URL
 }
 
 type Relay struct {
 	Proto    stamps.StampProtoType
 	Dnscrypt *DNSCryptRelay
 	ODoH     *ODoHRelay
+	Name     string
 }
 
 type ServersInfo struct {
 	sync.RWMutex
-	inner             []*ServerInfo
-	registeredServers []RegisteredServer
-	registeredRelays  []RegisteredServer
-	lbStrategy        LBStrategy
-	lbEstimator       bool
+	inner               []*ServerInfo
+	registeredServers   []RegisteredServer
+	registeredRelays    []RegisteredServer
+	lbStrategy          LBStrategy
+	lbEstimator         bool
+	odohRefreshMu       sync.Mutex
+	odohRefreshInFlight map[string]bool
+	odohLastFailureAt   map[string]time.Time
 }
 
 func NewServersInfo() ServersInfo {
-	return ServersInfo{lbStrategy: DefaultLBStrategy, lbEstimator: true, registeredServers: make([]RegisteredServer, 0), registeredRelays: make([]RegisteredServer, 0)}
+	return ServersInfo{
+		lbStrategy:          DefaultLBStrategy,
+		lbEstimator:         true,
+		registeredServers:   make([]RegisteredServer, 0),
+		registeredRelays:    make([]RegisteredServer, 0),
+		odohRefreshInFlight: make(map[string]bool),
+		odohLastFailureAt:   make(map[string]time.Time),
+	}
+}
+
+// beginODoHRefresh returns true if the caller should perform an ODoH key
+// refresh for the named server. It returns false when another refresh is
+// already in flight or when the previous attempt failed within the
+// failureCooldown window. Successful claims must be paired with a call to
+// endODoHRefresh, ideally via defer so a panic in the refresh path does
+// not leak the in-flight slot.
+func (serversInfo *ServersInfo) beginODoHRefresh(name string, failureCooldown time.Duration) bool {
+	now := time.Now()
+	serversInfo.odohRefreshMu.Lock()
+	defer serversInfo.odohRefreshMu.Unlock()
+	if serversInfo.odohRefreshInFlight == nil {
+		serversInfo.odohRefreshInFlight = make(map[string]bool)
+	}
+	if serversInfo.odohLastFailureAt == nil {
+		serversInfo.odohLastFailureAt = make(map[string]time.Time)
+	}
+	if serversInfo.odohRefreshInFlight[name] {
+		return false
+	}
+	if last, ok := serversInfo.odohLastFailureAt[name]; ok && now.Sub(last) < failureCooldown {
+		return false
+	}
+	serversInfo.odohRefreshInFlight[name] = true
+	return true
+}
+
+// endODoHRefresh releases the in-flight slot claimed by beginODoHRefresh and
+// records whether the refresh succeeded. On success the failure timestamp is
+// cleared so the next 401 can trigger a fresh refresh immediately if needed.
+// On failure the timestamp is stamped to throttle a hostile-relay retry
+// loop. Callers that claim a slot but then discover they have no refresh to
+// perform (e.g. the server is no longer registered) should use
+// cancelODoHRefresh instead so the cooldown state is not mutated.
+func (serversInfo *ServersInfo) endODoHRefresh(name string, success bool) {
+	serversInfo.odohRefreshMu.Lock()
+	defer serversInfo.odohRefreshMu.Unlock()
+	delete(serversInfo.odohRefreshInFlight, name)
+	if success {
+		delete(serversInfo.odohLastFailureAt, name)
+	} else {
+		if serversInfo.odohLastFailureAt == nil {
+			serversInfo.odohLastFailureAt = make(map[string]time.Time)
+		}
+		serversInfo.odohLastFailureAt[name] = time.Now()
+	}
+}
+
+// cancelODoHRefresh releases the in-flight slot without touching the failure
+// cooldown. It is used when beginODoHRefresh was claimed but no refresh
+// actually ran, so neither stamping a failure nor clearing a prior one is
+// appropriate.
+func (serversInfo *ServersInfo) cancelODoHRefresh(name string) {
+	serversInfo.odohRefreshMu.Lock()
+	defer serversInfo.odohRefreshMu.Unlock()
+	delete(serversInfo.odohRefreshInFlight, name)
 }
 
 func (serversInfo *ServersInfo) registerServer(name string, stamp stamps.ServerStamp) {
@@ -175,20 +288,23 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 	}
 	newServer.rtt = ewma.NewMovingAverage(RTTEwmaDecay)
 	newServer.rtt.Set(float64(newServer.initialRtt))
-	isNew = true
+	proxy.cryptoKeyMu.RLock()
+	proxy.recomputeServerSharedKeyLocked(&newServer)
 	serversInfo.Lock()
+	found := false
 	for i, oldServer := range serversInfo.inner {
 		if oldServer.Name == name {
 			serversInfo.inner[i] = &newServer
-			isNew = false
+			found = true
 			break
 		}
 	}
-	serversInfo.Unlock()
-	if isNew {
-		serversInfo.Lock()
+	if !found {
 		serversInfo.inner = append(serversInfo.inner, &newServer)
-		serversInfo.Unlock()
+	}
+	serversInfo.Unlock()
+	proxy.cryptoKeyMu.RUnlock()
+	if !found {
 		proxy.serversInfo.registerServer(name, stamp)
 	}
 
@@ -198,14 +314,37 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 	dlog.Debug("Refreshing certificates")
 	serversInfo.RLock()
-	registeredServers := serversInfo.registeredServers
+	// Appending registeredServers slice from sources may allocate new memory.
+	serversCount := len(serversInfo.registeredServers)
+	registeredServers := make([]RegisteredServer, serversCount)
+	copy(registeredServers, serversInfo.registeredServers)
 	serversInfo.RUnlock()
+	rand.Shuffle(len(registeredServers), func(i, j int) {
+		registeredServers[i], registeredServers[j] = registeredServers[j], registeredServers[i]
+	})
+	countChannel := make(chan struct{}, proxy.certRefreshConcurrency)
+	errorChannel := make(chan error, serversCount)
+	for i := range registeredServers {
+		countChannel <- struct{}{}
+		go func(registeredServer *RegisteredServer) {
+			err := serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp)
+			if err == nil {
+				proxy.xTransport.internalResolverReady.Store(true)
+			}
+			errorChannel <- err
+			<-countChannel
+		}(&registeredServers[i])
+	}
 	liveServers := 0
 	var err error
-	for _, registeredServer := range registeredServers {
-		if err = serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp); err == nil {
+	for range serversCount {
+		err = <-errorChannel
+		if err == nil {
 			liveServers++
 		}
+	}
+	if liveServers > 0 {
+		err = nil
 	}
 	serversInfo.Lock()
 	sort.SliceStable(serversInfo.inner, func(i, j int) bool {
@@ -215,47 +354,97 @@ func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 	innerLen := len(inner)
 	if innerLen > 1 {
 		dlog.Notice("Sorted latencies:")
-		for i := 0; i < innerLen; i++ {
+		for i := range innerLen {
 			dlog.Noticef("- %5dms %s", inner[i].initialRtt, inner[i].Name)
 		}
 	}
 	if innerLen > 0 {
-		dlog.Noticef("Server with the lowest initial latency: %s (rtt: %dms)", inner[0].Name, inner[0].initialRtt)
+		dlog.Noticef("Server with the lowest initial latency: %s (rtt: %dms), live servers: %d", inner[0].Name, inner[0].initialRtt, innerLen)
 	}
 	serversInfo.Unlock()
 	return liveServers, err
 }
 
-func (serversInfo *ServersInfo) estimatorUpdate() {
+func (serversInfo *ServersInfo) estimatorUpdate(currentActive int) {
 	// serversInfo.RWMutex is assumed to be Locked
-	candidate := rand.Intn(len(serversInfo.inner))
-	if candidate == 0 {
+	serversCount := len(serversInfo.inner)
+	activeCount := serversInfo.lbStrategy.getActiveCount(serversCount)
+	if activeCount == serversCount {
 		return
 	}
-	candidateRtt, currentBestRtt := serversInfo.inner[candidate].rtt.Value(), serversInfo.inner[0].rtt.Value()
-	if currentBestRtt < 0 {
-		currentBestRtt = candidateRtt
-		serversInfo.inner[0].rtt.Set(currentBestRtt)
+	candidate := rand.Intn(serversCount-activeCount) + activeCount
+	candidateRtt, currentActiveRtt := serversInfo.inner[candidate].rtt.Value(), serversInfo.inner[currentActive].rtt.Value()
+	if currentActiveRtt < 0 {
+		currentActiveRtt = candidateRtt
+		serversInfo.inner[currentActive].rtt.Set(currentActiveRtt)
+		return
 	}
-	partialSort := false
-	if candidateRtt < currentBestRtt {
-		serversInfo.inner[candidate], serversInfo.inner[0] = serversInfo.inner[0], serversInfo.inner[candidate]
-		partialSort = true
-		dlog.Debugf("New preferred candidate: %v (rtt: %d vs previous: %d)", serversInfo.inner[0].Name, int(candidateRtt), int(currentBestRtt))
-	} else if candidateRtt > 0 && candidateRtt >= currentBestRtt*4.0 {
-		if time.Since(serversInfo.inner[candidate].lastActionTS) > time.Duration(1*time.Minute) {
-			serversInfo.inner[candidate].rtt.Add(MinF(MaxF(candidateRtt/2.0, currentBestRtt*2.0), candidateRtt))
-			dlog.Debugf("Giving a new chance to candidate [%s], lowering its RTT from %d to %d (best: %d)", serversInfo.inner[candidate].Name, int(candidateRtt), int(serversInfo.inner[candidate].rtt.Value()), int(currentBestRtt))
-			partialSort = true
+	if candidateRtt < currentActiveRtt {
+		serversInfo.inner[candidate], serversInfo.inner[currentActive] = serversInfo.inner[currentActive], serversInfo.inner[candidate]
+		dlog.Debugf(
+			"New preferred candidate: %s (RTT: %d vs previous: %d)",
+			serversInfo.inner[currentActive].Name,
+			int(candidateRtt),
+			int(currentActiveRtt),
+		)
+		serversInfo.sortByRtt()
+	}
+}
+
+func (serversInfo *ServersInfo) sortByRtt() {
+	for i := 1; i < len(serversInfo.inner); i++ {
+		if serversInfo.inner[i-1].rtt.Value() > serversInfo.inner[i].rtt.Value() {
+			serversInfo.inner[i-1], serversInfo.inner[i] = serversInfo.inner[i], serversInfo.inner[i-1]
 		}
 	}
-	if partialSort {
-		serversCount := len(serversInfo.inner)
-		for i := 1; i < serversCount; i++ {
-			if serversInfo.inner[i-1].rtt.Value() > serversInfo.inner[i].rtt.Value() {
-				serversInfo.inner[i-1], serversInfo.inner[i] = serversInfo.inner[i], serversInfo.inner[i-1]
-			}
+}
+
+func (serversInfo *ServersInfo) recoverDormantServers() {
+	if len(serversInfo.inner) <= 1 {
+		return
+	}
+	bestRtt := serversInfo.inner[0].rtt.Value()
+	for _, server := range serversInfo.inner {
+		if rtt := server.rtt.Value(); rtt > 0 && rtt < bestRtt {
+			bestRtt = rtt
 		}
+	}
+	if bestRtt <= 0 {
+		return
+	}
+	now := time.Now()
+	needsSort := false
+	for _, server := range serversInfo.inner {
+		currentRtt := server.rtt.Value()
+		if currentRtt <= bestRtt*4.0 {
+			continue
+		}
+		if now.Sub(server.lastActionTS) <= time.Minute {
+			continue
+		}
+		if now.Sub(server.lastDecayTS) <= 10*time.Second {
+			continue
+		}
+		targetRtt := float64(server.initialRtt)
+		if targetRtt <= 0 {
+			targetRtt = bestRtt
+		}
+		server.rtt.Add(targetRtt)
+		newRtt := server.rtt.Value()
+		server.totalQueries = 0
+		server.failedQueries = 0
+		server.lastDecayTS = now
+		needsSort = true
+		dlog.Debugf(
+			"Giving a new chance to [%s], lowering its RTT from %d to %d (best: %d)",
+			server.Name,
+			int(currentRtt),
+			int(newRtt),
+			int(bestRtt),
+		)
+	}
+	if needsSort {
+		serversInfo.sortByRtt()
 	}
 }
 
@@ -266,15 +455,136 @@ func (serversInfo *ServersInfo) getOne() *ServerInfo {
 		serversInfo.Unlock()
 		return nil
 	}
-	if serversInfo.lbEstimator {
-		serversInfo.estimatorUpdate()
+
+	serversInfo.recoverDormantServers()
+
+	var candidate int
+
+	// Check if using WP2 strategy
+	if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); isWP2 {
+		candidate = serversInfo.getWeightedCandidate(serversCount)
+	} else {
+		candidate = serversInfo.lbStrategy.getCandidate(serversCount)
+		if serversInfo.lbEstimator {
+			serversInfo.estimatorUpdate(candidate)
+		}
 	}
-	candidate := serversInfo.lbStrategy.getCandidate(serversCount)
+
 	serverInfo := serversInfo.inner[candidate]
-	dlog.Debugf("Using candidate [%s] RTT: %d", (*serverInfo).Name, int((*serverInfo).rtt.Value()))
+	dlog.Debugf("Using candidate [%s] RTT: %d Score: %.3f",
+		serverInfo.Name,
+		int(serverInfo.rtt.Value()),
+		serversInfo.calculateServerScore(serverInfo))
 	serversInfo.Unlock()
 
 	return serverInfo
+}
+
+// getWeightedCandidate implements the WP2 algorithm
+func (serversInfo *ServersInfo) getWeightedCandidate(serversCount int) int {
+	if serversCount <= 1 {
+		return 0
+	}
+
+	// Select two random servers
+	first := rand.Intn(serversCount)
+	second := rand.Intn(serversCount)
+
+	// Ensure we have two different servers
+	for second == first {
+		second = rand.Intn(serversCount)
+	}
+
+	server1 := serversInfo.inner[first]
+	server2 := serversInfo.inner[second]
+
+	// Calculate weighted scores
+	score1 := serversInfo.calculateServerScore(server1)
+	score2 := serversInfo.calculateServerScore(server2)
+
+	// Select the better performing server with small randomization
+	if score1 > score2 {
+		return first
+	} else if score2 > score1 {
+		return second
+	} else {
+		// Tie-breaker: random selection
+		if rand.Float64() < 0.5 {
+			return first
+		}
+		return second
+	}
+}
+
+// calculateServerScore computes a performance score for server selection
+func (serversInfo *ServersInfo) calculateServerScore(server *ServerInfo) float64 {
+	// Base score from RTT (lower RTT = higher score)
+	rtt := server.rtt.Value()
+	if rtt <= 0 {
+		rtt = 1000 // Default high RTT for servers without data
+	}
+
+	// Normalize RTT to a 0-1 scale (1000ms max)
+	rttScore := 1.0 - (rtt / 1000.0)
+	if rttScore < 0.0 {
+		rttScore = 0.0
+	}
+
+	// Success rate score
+	successRate := 1.0 // Default to perfect success rate
+	if server.totalQueries > 0 {
+		successRate = float64(server.totalQueries-server.failedQueries) / float64(server.totalQueries)
+	}
+
+	// Combine scores (RTT weighted 70%, success rate 30%)
+	finalScore := (rttScore * 0.7) + (successRate * 0.3)
+
+	return finalScore
+}
+
+// updateServerStats updates server statistics after each query
+func (serversInfo *ServersInfo) updateServerStats(serverName string, success bool) {
+	serversInfo.Lock()
+	defer serversInfo.Unlock()
+
+	for _, server := range serversInfo.inner {
+		if server.Name == serverName {
+			server.totalQueries++
+			if !success {
+				server.failedQueries++
+			}
+			server.lastUpdateTime = time.Now()
+
+			// Reset counters periodically to prevent overflow and adapt to changes
+			if server.totalQueries > 10000 {
+				server.totalQueries = server.totalQueries / 2
+				server.failedQueries = server.failedQueries / 2
+			}
+			break
+		}
+	}
+}
+
+// logWP2Stats logs WP2 performance statistics for debugging
+func (serversInfo *ServersInfo) logWP2Stats() {
+	if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); !isWP2 {
+		return
+	}
+
+	serversInfo.RLock()
+	defer serversInfo.RUnlock()
+
+	dlog.Debug("WP2 Strategy Server Statistics:")
+	for i, server := range serversInfo.inner {
+		score := serversInfo.calculateServerScore(server)
+		successRate := 1.0
+		if server.totalQueries > 0 {
+			successRate = float64(server.totalQueries-server.failedQueries) / float64(server.totalQueries)
+		}
+
+		dlog.Debugf("[%d] %s: RTT=%dms, Score=%.3f, Success=%.2f%%, Queries=%d",
+			i, server.Name, int(server.rtt.Value()), score, successRate*100, server.totalQueries)
+	}
 }
 
 func fetchServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
@@ -298,12 +608,32 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 		}
 	}
 	if serverIdx < 0 {
+		proxy.serversInfo.RUnlock()
 		return nil
 	}
 	server := proxy.serversInfo.registeredServers[serverIdx]
 	proxy.serversInfo.RUnlock()
+
+	// Fall back to random relays until the logic is implemented for non-DNSCrypt relays
+	if server.stamp.Proto == stamps.StampProtoTypeODoHTarget {
+		candidates := make([]int, 0)
+		for relayIdx, relayStamp := range relayStamps {
+			if relayStamp.Proto != stamps.StampProtoTypeODoHRelay {
+				continue
+			}
+			candidates = append(candidates, relayIdx)
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+		return &relayStamps[candidates[rand.Intn(len(candidates))]]
+	} else if server.stamp.Proto != stamps.StampProtoTypeDNSCrypt {
+		return nil
+	}
+
+	// Anonymized DNSCrypt relays
 	serverAddrStr, _ := ExtractHostAndPort(server.stamp.ServerAddrStr, 443)
-	serverAddr := net.ParseIP(serverAddrStr)
+	serverAddr := ParseIP(serverAddrStr)
 	if serverAddr == nil {
 		return nil
 	}
@@ -313,8 +643,11 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 	bestRelayIdxs := make([]int, 0)
 	bestRelaySamePrefixBits := 128
 	for relayIdx, relayStamp := range relayStamps {
+		if relayStamp.Proto != stamps.StampProtoTypeDNSCryptRelay {
+			continue
+		}
 		relayAddrStr, _ := ExtractHostAndPort(relayStamp.ServerAddrStr, 443)
-		relayAddr := net.ParseIP(relayAddrStr)
+		relayAddr := ParseIP(relayAddrStr)
 		if relayAddr == nil {
 			continue
 		}
@@ -334,15 +667,31 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 				break
 			}
 		}
-		if samePrefixBits <= bestRelaySamePrefixBits {
+		if samePrefixBits < bestRelaySamePrefixBits {
 			bestRelaySamePrefixBits = samePrefixBits
+			bestRelayIdxs = []int{relayIdx}
+		} else if samePrefixBits == bestRelaySamePrefixBits {
 			bestRelayIdxs = append(bestRelayIdxs, relayIdx)
 		}
+	}
+	if len(bestRelayIdxs) == 0 {
+		return nil
 	}
 	return &relayStamps[bestRelayIdxs[rand.Intn(len(bestRelayIdxs))]]
 }
 
-func route(proxy *Proxy, name string) (*Relay, error) {
+func relayProtoForServerProto(proto stamps.StampProtoType) (stamps.StampProtoType, error) {
+	switch proto {
+	case stamps.StampProtoTypeDNSCrypt:
+		return stamps.StampProtoTypeDNSCryptRelay, nil
+	case stamps.StampProtoTypeODoHTarget:
+		return stamps.StampProtoTypeODoHRelay, nil
+	default:
+		return 0, errors.New("protocol cannot be anonymized")
+	}
+}
+
+func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay, error) {
 	routes := proxy.routes
 	if routes == nil {
 		return nil, nil
@@ -353,17 +702,30 @@ func route(proxy *Proxy, name string) (*Relay, error) {
 		wildcard = true
 		relayNames, ok = (*routes)["*"]
 	}
-	if !ok {
+	if !ok || len(relayNames) == 0 {
+		return nil, nil
+	}
+
+	relayProto, err := relayProtoForServerProto(serverProto)
+	if err != nil {
+		dlog.Errorf("Server [%v]'s protocol doesn't support anonymization", name)
 		return nil, nil
 	}
 	relayStamps := make([]stamps.ServerStamp, 0)
+	relayStampToName := make(map[string]string)
 	for _, relayName := range relayNames {
 		if relayStamp, err := stamps.NewServerStampFromString(relayName); err == nil {
-			relayStamps = append(relayStamps, relayStamp)
+			if relayStamp.Proto == relayProto {
+				relayStamps = append(relayStamps, relayStamp)
+				relayStampToName[relayStamp.String()] = relayName
+			}
 		} else if relayName == "*" {
 			proxy.serversInfo.RLock()
 			for _, registeredServer := range proxy.serversInfo.registeredRelays {
-				relayStamps = append(relayStamps, registeredServer.stamp)
+				if registeredServer.stamp.Proto == relayProto {
+					relayStamps = append(relayStamps, registeredServer.stamp)
+					relayStampToName[registeredServer.stamp.String()] = registeredServer.name
+				}
 			}
 			proxy.serversInfo.RUnlock()
 			wildcard = true
@@ -371,14 +733,9 @@ func route(proxy *Proxy, name string) (*Relay, error) {
 		} else {
 			proxy.serversInfo.RLock()
 			for _, registeredServer := range proxy.serversInfo.registeredRelays {
-				if registeredServer.name == relayName {
+				if registeredServer.name == relayName && registeredServer.stamp.Proto == relayProto {
 					relayStamps = append(relayStamps, registeredServer.stamp)
-					break
-				}
-			}
-			for _, registeredServer := range proxy.serversInfo.registeredServers {
-				if registeredServer.name == relayName {
-					relayStamps = append(relayStamps, registeredServer.stamp)
+					relayStampToName[registeredServer.stamp.String()] = relayName
 					break
 				}
 			}
@@ -386,7 +743,8 @@ func route(proxy *Proxy, name string) (*Relay, error) {
 		}
 	}
 	if len(relayStamps) == 0 {
-		return nil, fmt.Errorf("Empty relay set for [%v]", name)
+		err := fmt.Errorf("Non-existent relay set for server [%v]", name)
+		return nil, err
 	}
 	var relayCandidateStamp *stamps.ServerStamp
 	if !wildcard || len(relayStamps) == 1 {
@@ -397,15 +755,7 @@ func route(proxy *Proxy, name string) (*Relay, error) {
 	if relayCandidateStamp == nil {
 		return nil, fmt.Errorf("No valid relay for server [%v]", name)
 	}
-	relayName := relayCandidateStamp.ServerAddrStr
-	proxy.serversInfo.RLock()
-	for _, registeredServer := range proxy.serversInfo.registeredRelays {
-		if registeredServer.stamp.ServerAddrStr == relayCandidateStamp.ServerAddrStr {
-			relayName = registeredServer.name
-			break
-		}
-	}
-	proxy.serversInfo.RUnlock()
+	relayName := relayStampToName[relayCandidateStamp.String()]
 	switch relayCandidateStamp.Proto {
 	case stamps.StampProtoTypeDNSCrypt, stamps.StampProtoTypeDNSCryptRelay:
 		relayUDPAddr, err := net.ResolveUDPAddr("udp", relayCandidateStamp.ServerAddrStr)
@@ -417,35 +767,54 @@ func route(proxy *Proxy, name string) (*Relay, error) {
 			return nil, err
 		}
 		dlog.Noticef("Anonymizing queries for [%v] via [%v]", name, relayName)
-		return &Relay{Proto: stamps.StampProtoTypeDNSCryptRelay, Dnscrypt: &DNSCryptRelay{RelayUDPAddr: relayUDPAddr, RelayTCPAddr: relayTCPAddr}}, nil
+		return &Relay{
+			Proto:    stamps.StampProtoTypeDNSCryptRelay,
+			Dnscrypt: &DNSCryptRelay{RelayUDPAddr: relayUDPAddr, RelayTCPAddr: relayTCPAddr},
+			Name:     relayName,
+		}, nil
 	case stamps.StampProtoTypeODoHRelay:
-		target, err := url.Parse("https://" + relayCandidateStamp.ProviderName + "/" + relayCandidateStamp.Path)
+		relayBaseURL, err := url.Parse(
+			"https://" + url.PathEscape(relayCandidateStamp.ProviderName) + relayCandidateStamp.Path,
+		)
 		if err != nil {
 			return nil, err
 		}
-
-		for _, server := range proxy.registeredServers {
-			if server.name == name && server.stamp.Proto == stamps.StampProtoTypeODoHTarget {
-				qs := target.Query()
-				qs.Add("targethost", server.stamp.ProviderName)
-				qs.Add("targetpath", server.stamp.Path)
-				target2 := *target
-				target2.RawQuery = qs.Encode()
-				target = &target2
-				break
+		var relayURLforTarget *url.URL
+		proxy.serversInfo.RLock()
+		for _, server := range proxy.serversInfo.registeredServers {
+			if server.name != name || server.stamp.Proto != stamps.StampProtoTypeODoHTarget {
+				continue
+			}
+			qs := relayBaseURL.Query()
+			qs.Add("targethost", server.stamp.ProviderName)
+			qs.Add("targetpath", server.stamp.Path)
+			tmp := *relayBaseURL
+			tmp.RawQuery = qs.Encode()
+			relayURLforTarget = &tmp
+			break
+		}
+		proxy.serversInfo.RUnlock()
+		if relayURLforTarget == nil {
+			return nil, fmt.Errorf("Relay [%v] not found", relayName)
+		}
+		if len(relayCandidateStamp.ServerAddrStr) > 0 {
+			ipOnly, _ := ExtractHostAndPort(relayCandidateStamp.ServerAddrStr, -1)
+			if ip := ParseIP(ipOnly); ip != nil {
+				host, _ := ExtractHostAndPort(relayCandidateStamp.ProviderName, -1)
+				proxy.xTransport.saveCachedIP(host, ip, -1*time.Second)
 			}
 		}
-
+		dlog.Noticef("Anonymizing queries for [%v] via [%v]", name, relayName)
 		return &Relay{Proto: stamps.StampProtoTypeODoHRelay, ODoH: &ODoHRelay{
-			url: target,
-		}}, nil
+			URL: relayURLforTarget,
+		}, Name: relayName}, nil
 	}
 	return nil, fmt.Errorf("Invalid relay set for server [%v]", name)
 }
 
 func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
 	if len(stamp.ServerPk) != ed25519.PublicKeySize {
-		serverPk, err := hex.DecodeString(strings.Replace(string(stamp.ServerPk), ":", "", -1))
+		serverPk, err := hex.DecodeString(strings.ReplaceAll(string(stamp.ServerPk), ":", ""))
 		if err != nil || len(serverPk) != ed25519.PublicKeySize {
 			dlog.Fatalf("Unsupported public key for [%s]: [%s]", name, stamp.ServerPk)
 		}
@@ -453,14 +822,11 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 		stamp.ServerPk = serverPk
 	}
 	knownBugs := ServerBugs{}
-	for _, buggyServerName := range proxy.serversBlockingFragments {
-		if buggyServerName == name {
-			knownBugs.fragmentsBlocked = true
-			dlog.Infof("Known bug in [%v]: fragmented questions over UDP are blocked", name)
-			break
-		}
+	if slices.Contains(proxy.serversBlockingFragments, name) {
+		knownBugs.fragmentsBlocked = true
+		dlog.Infof("Known bug in [%v]: fragmented questions over UDP are blocked", name)
 	}
-	relay, err := route(proxy, name)
+	relay, err := route(proxy, name, stamp.Proto)
 	if err != nil {
 		return ServerInfo{}, err
 	}
@@ -468,7 +834,17 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 	if relay != nil {
 		dnscryptRelay = relay.Dnscrypt
 	}
-	certInfo, rtt, fragmentsBlocked, err := FetchCurrentDNSCryptCert(proxy, &name, proxy.mainProto, stamp.ServerPk, stamp.ServerAddrStr, stamp.ProviderName, isNew, dnscryptRelay, knownBugs)
+	certInfo, rtt, fragmentsBlocked, err := FetchCurrentDNSCryptCert(
+		proxy,
+		&name,
+		proxy.xTransport.mainProto,
+		stamp.ServerPk,
+		stamp.ServerAddrStr,
+		stamp.ProviderName,
+		isNew,
+		dnscryptRelay,
+		knownBugs,
+	)
 	if !knownBugs.fragmentsBlocked && fragmentsBlocked {
 		dlog.Debugf("[%v] drops fragmented queries", name)
 		knownBugs.fragmentsBlocked = true
@@ -484,6 +860,9 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 	if err != nil {
 		return ServerInfo{}, err
 	}
+	if certInfo.CryptoConstruction == XWingPQ {
+		dlog.Noticef("[%v] using the post-quantum X-Wing key exchange", name)
+	}
 	remoteUDPAddr, err := net.ResolveUDPAddr("udp", stamp.ServerAddrStr)
 	if err != nil {
 		return ServerInfo{}, err
@@ -492,12 +871,50 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 	if err != nil {
 		return ServerInfo{}, err
 	}
+
+	if certInfo.CryptoConstruction == XSalsa20Poly1305 {
+		query := plainNXTestPacket(0xcafe)
+		msg, _, _, err := DNSExchange(
+			proxy,
+			proxy.xTransport.mainProto,
+			query,
+			stamp.ServerAddrStr,
+			dnscryptRelay,
+			&name,
+			false,
+		)
+		if err == nil {
+			dlog.Debugf("[%s] also serves plaintext DNS", name)
+			for _, rr := range msg.Answer {
+				rrType := dns.RRToType(rr)
+				if rrType == dns.TypeA || rrType == dns.TypeAAAA {
+					dlog.Warnf("[%s] may be a lying resolver -- skipping", name)
+					return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, rr.String())
+				}
+			}
+			for _, rr := range msg.Extra {
+				if dns.RRToType(rr) == dns.TypeTXT {
+					dlog.Warnf("[%s] may be a dummy resolver -- skipping", name)
+					txts := rr.(*dns.TXT).Txt
+					cause := ""
+					if len(txts) > 0 {
+						cause = txts[0]
+					}
+					return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, cause)
+				}
+			}
+		}
+	}
+
 	return ServerInfo{
 		Proto:              stamps.StampProtoTypeDNSCrypt,
 		MagicQuery:         certInfo.MagicQuery,
 		ServerPk:           certInfo.ServerPk,
 		SharedKey:          certInfo.SharedKey,
 		CryptoConstruction: certInfo.CryptoConstruction,
+		PqPublicKey:        certInfo.PqPublicKey,
+		PqCertContext:      certInfo.PqCertContext,
+		pqSession:          newPqSessionState(certInfo.CryptoConstruction),
 		Name:               name,
 		Timeout:            proxy.timeout,
 		UDPAddr:            remoteUDPAddr,
@@ -508,45 +925,53 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 	}, nil
 }
 
-func dohTestPacket(msgID uint16) []byte {
-	msg := dns.Msg{}
-	msg.SetQuestion(".", dns.TypeNS)
-	msg.Id = msgID
-	msg.MsgHdr.RecursionDesired = true
-	msg.SetEdns0(uint16(MaxDNSPacketSize), false)
-	ext := new(dns.EDNS0_PADDING)
-	ext.Padding = make([]byte, 16)
-	crypto_rand.Read(ext.Padding)
-	edns0 := msg.IsEdns0()
-	edns0.Option = append(edns0.Option, ext)
-	body, err := msg.Pack()
-	if err != nil {
+func dohTestPacket(msgID uint16) *dns.Msg {
+	msg := dns.NewMsg(".", dns.TypeNS)
+	msg.ID = msgID
+	msg.RecursionDesired = true
+	msg.UDPSize = uint16(MaxDNSPacketSize)
+	msg.Security = false
+	paddingData := make([]byte, 16)
+	_, _ = crypto_rand.Read(paddingData)
+	padding := &dns.PADDING{Padding: hex.EncodeToString(paddingData)}
+	msg.Pseudo = append(msg.Pseudo, padding)
+	if err := msg.Pack(); err != nil {
 		dlog.Fatal(err)
 	}
-	return body
+	return msg
 }
 
-func dohNXTestPacket(msgID uint16) []byte {
-	msg := dns.Msg{}
+func dohNXTestPacket(msgID uint16) *dns.Msg {
 	qName := make([]byte, 16)
 	charset := "abcdefghijklmnopqrstuvwxyz"
 	for i := range qName {
 		qName[i] = charset[rand.Intn(len(charset))]
 	}
-	msg.SetQuestion(string(qName)+".test.dnscrypt.", dns.TypeNS)
-	msg.Id = msgID
-	msg.MsgHdr.RecursionDesired = true
-	msg.SetEdns0(uint16(MaxDNSPacketSize), false)
-	ext := new(dns.EDNS0_PADDING)
-	ext.Padding = make([]byte, 16)
-	crypto_rand.Read(ext.Padding)
-	edns0 := msg.IsEdns0()
-	edns0.Option = append(edns0.Option, ext)
-	body, err := msg.Pack()
-	if err != nil {
+	msg := dns.NewMsg(string(qName)+".test.dnscrypt.", dns.TypeNS)
+	msg.ID = msgID
+	msg.RecursionDesired = true
+	msg.UDPSize = uint16(MaxDNSPacketSize)
+	msg.Security = false
+	paddingData := make([]byte, 16)
+	_, _ = crypto_rand.Read(paddingData)
+	padding := &dns.PADDING{Padding: hex.EncodeToString(paddingData)}
+	msg.Pseudo = append(msg.Pseudo, padding)
+	if err := msg.Pack(); err != nil {
 		dlog.Fatal(err)
 	}
-	return body
+	return msg
+}
+
+func plainNXTestPacket(msgID uint16) *dns.Msg {
+	qName := make([]byte, 16)
+	charset := "abcdefghijklmnopqrstuvwxyz"
+	for i := range qName {
+		qName[i] = charset[rand.Intn(len(charset))]
+	}
+	msg := dns.NewMsg(string(qName)+".test.dnscrypt.", dns.TypeNS)
+	msg.ID = msgID
+	msg.RecursionDesired = true
+	return msg
 }
 
 func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
@@ -557,7 +982,8 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 	if len(stamp.ServerAddrStr) > 0 {
 		ipOnly, _ := ExtractHostAndPort(stamp.ServerAddrStr, -1)
 		if ip := ParseIP(ipOnly); ip != nil {
-			proxy.xTransport.saveCachedIP(stamp.ProviderName, ip, -1*time.Second)
+			host, _ := ExtractHostAndPort(stamp.ProviderName, -1)
+			proxy.xTransport.saveCachedIP(host, ip, -1*time.Second)
 		}
 	}
 	url := &url.URL{
@@ -565,26 +991,21 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 		Host:   stamp.ProviderName,
 		Path:   stamp.Path,
 	}
-	body := dohTestPacket(0xcafe)
-	dohClientCreds, ok := (*proxy.dohCreds)[name]
-	if !ok {
-		dohClientCreds, ok = (*proxy.dohCreds)["*"]
-	}
-	if ok {
-		dlog.Noticef("Enabling TLS authentication for [%s]", name)
-		proxy.xTransport.tlsClientCreds = dohClientCreds
-		proxy.xTransport.rebuildTransport()
-	}
+	body := dohTestPacket(0xcafe).Data
 	useGet := false
 	if _, _, _, _, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout); err != nil {
+		if errors.Is(err, errCertHashNotFound) {
+			dlog.Criticalf("[%s] Certificate hash %x not found", name, stamp.Hashes)
+			return ServerInfo{}, err
+		}
 		useGet = true
 		if _, _, _, _, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout); err != nil {
 			return ServerInfo{}, err
 		}
 		dlog.Debugf("Server [%s] doesn't appear to support POST; falling back to GET requests", name)
 	}
-	body = dohNXTestPacket(0xcafe)
-	serverResponse, _, tls, rtt, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout)
+	queryMsg := dohNXTestPacket(0xcafe)
+	serverResponse, _, tls, rtt, err := proxy.xTransport.DoHQuery(useGet, url, queryMsg.Data, proxy.timeout)
 	if err != nil {
 		dlog.Infof("[%s] [%s]: %v", name, url, err)
 		return ServerInfo{}, err
@@ -592,25 +1013,26 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 	if tls == nil || !tls.HandshakeComplete {
 		return ServerInfo{}, errors.New("TLS handshake failed")
 	}
-	msg := dns.Msg{}
-	if err := msg.Unpack(serverResponse); err != nil {
+	msg := dns.Msg{Data: serverResponse}
+	if err := msg.Unpack(); err != nil {
 		dlog.Warnf("[%s]: %v", name, err)
 		return ServerInfo{}, err
 	}
+	if err := validateResponseForQuery(queryMsg, &msg); err != nil {
+		return ServerInfo{}, err
+	}
 	if msg.Rcode != dns.RcodeNameError {
-		dlog.Criticalf("[%s] may be a lying resolver", name)
+		return ServerInfo{}, fmt.Errorf("[%s] may be a lying resolver -- skipping", name)
 	}
 	protocol := tls.NegotiatedProtocol
 	if len(protocol) == 0 {
 		protocol = "http/1.x"
 	}
 	if strings.HasPrefix(protocol, "http/1.") {
-		dlog.Warnf("[%s] does not support HTTP/2", name)
+		dlog.Warnf("[%s] does not support HTTP/2 nor HTTP/3", name)
 	}
 	dlog.Infof("[%s] TLS version: %x - Protocol: %v - Cipher suite: %v", name, tls.Version, protocol, tls.CipherSuite)
 	showCerts := proxy.showCerts
-	found := false
-	var wantedHash [32]byte
 	for _, cert := range tls.PeerCertificates {
 		h := sha256.Sum256(cert.RawTBSCertificate)
 		if showCerts {
@@ -618,26 +1040,13 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 		} else {
 			dlog.Debugf("Advertised cert: [%s] [%x]", cert.Subject, h)
 		}
-		for _, hash := range stamp.Hashes {
-			if len(hash) == len(wantedHash) {
-				copy(wantedHash[:], hash)
-				if h == wantedHash {
-					found = true
-					break
-				}
-			}
-		}
-		if found {
-			break
-		}
 	}
-	if !found && len(stamp.Hashes) > 0 {
-		dlog.Criticalf("[%s] Certificate hash [%x] not found", name, wantedHash)
-		return ServerInfo{}, fmt.Errorf("Certificate hash not found")
+	if len(stamp.Hashes) > 0 && !certHashesMatch(tls, stamp.Hashes) {
+		dlog.Criticalf("[%s] Certificate hash %x not found", name, stamp.Hashes)
+		return ServerInfo{}, errCertHashNotFound
 	}
-	respBody := serverResponse
-	if len(respBody) < MinDNSPacketSize || len(respBody) > MaxDNSPacketSize ||
-		respBody[0] != 0xca || respBody[1] != 0xfe || respBody[4] != 0x00 || respBody[5] != 0x01 {
+	if len(serverResponse) < MinDNSPacketSize || len(serverResponse) > MaxDNSPacketSize ||
+		serverResponse[0] != 0xca || serverResponse[1] != 0xfe || serverResponse[4] != 0x00 || serverResponse[5] != 0x01 {
 		dlog.Info("Webserver returned an unexpected response")
 		return ServerInfo{}, errors.New("Webserver returned an unexpected response")
 	}
@@ -658,60 +1067,225 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 	}, nil
 }
 
-func fetchTargetConfigsFromWellKnown(url string) ([]ODoHTarget, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func fetchTargetConfigsFromWellKnown(proxy *Proxy, url *url.URL) ([]ODoHTargetConfig, error) {
+	bin, statusCode, _, _, err := proxy.xTransport.Get(url, "application/binary", 0)
 	if err != nil {
 		return nil, err
 	}
-
-	client := http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, fmt.Errorf("HTTP status code was %v", statusCode)
 	}
-	bodyBytes, err := ioutil.ReadAll(resp.Body)
-	defer resp.Body.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	return parseODoHTargetConfigs(bodyBytes)
+	return parseODoHTargetConfigs(bin)
 }
 
-func fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
-	odohTargets, err := fetchTargetConfigsFromWellKnown("https://" + stamp.ProviderName + "/.well-known/odohconfigs")
-	if err != nil || len(odohTargets) == 0 {
-		return ServerInfo{}, fmt.Errorf("[%s] does not have an Oblivious DoH configuration", name)
+func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
+	configURL := &url.URL{Scheme: "https", Host: stamp.ProviderName, Path: "/.well-known/odohconfigs"}
+	odohTargetConfigs, err := fetchTargetConfigsFromWellKnown(proxy, configURL)
+	if err != nil {
+		dlog.Debug(configURL)
+		return ServerInfo{}, fmt.Errorf("[%s] didn't return an ODoH configuration - [%v]", name, err)
+	} else if len(odohTargetConfigs) == 0 {
+		dlog.Debug(configURL)
+		return ServerInfo{}, fmt.Errorf("[%s] has an empty ODoH configuration", name)
 	}
 
-	relay, err := route(proxy, name)
+	relay, err := route(proxy, name, stamp.Proto)
 	if err != nil {
 		return ServerInfo{}, err
 	}
-	if relay == nil || relay.ODoH == nil {
-		relay = nil
-	}
 
 	if relay == nil {
-		dlog.Notice("Relay is empty for " + name)
+		dlog.Criticalf(
+			"No relay defined for [%v] - Configuring an ODoH relay is required for ODoH servers (see the `[anonymized_dns]` section)",
+			name,
+		)
+		return ServerInfo{}, errors.New("No ODoH relay")
+	} else {
+		if relay.ODoH == nil {
+			dlog.Criticalf("Wrong relay type defined for [%v] - ODoH servers require an ODoH relay", name)
+			return ServerInfo{}, errors.New("Wrong ODoH relay type")
+		}
 	}
 
-	url := &url.URL{
+	dlog.Debugf("Pausing after ODoH configuration retrieval")
+	delay := time.Duration(rand.Intn(5*1000)) * time.Millisecond
+	clocksmith.Sleep(time.Duration(delay))
+	dlog.Debugf("Pausing done")
+
+	targetURL := &url.URL{
 		Scheme: "https",
 		Host:   stamp.ProviderName,
 		Path:   stamp.Path,
 	}
 
-	return ServerInfo{
-		Proto:       stamps.StampProtoTypeODoHTarget,
-		Name:        name,
-		Timeout:     proxy.timeout,
-		URL:         url,
-		HostName:    stamp.ProviderName,
-		useGet:      false,
-		odohTargets: odohTargets,
-		Relay:       relay,
-	}, nil
+	workingConfigs := make([]ODoHTargetConfig, 0)
+	var lastProbeErr error
+	rand.Shuffle(len(odohTargetConfigs), func(i, j int) {
+		odohTargetConfigs[i], odohTargetConfigs[j] = odohTargetConfigs[j], odohTargetConfigs[i]
+	})
+	for _, odohTargetConfig := range odohTargetConfigs {
+		url := relay.ODoH.URL
+
+		odohQuery, err := odohTargetConfig.encryptQuery(dohTestPacket(0xcafe).Data)
+		if err != nil {
+			lastProbeErr = fmt.Errorf("failed to encrypt ODoH probe: %w", err)
+			continue
+		}
+
+		useGet := false
+		_, postStatusCode, _, _, postErr := proxy.xTransport.ObliviousDoHQuery(useGet, url, odohQuery.odohMessage, proxy.timeout)
+		if postErr != nil {
+			useGet = true
+			_, getStatusCode, _, _, getErr := proxy.xTransport.ObliviousDoHQuery(useGet, url, odohQuery.odohMessage, proxy.timeout)
+			if getErr != nil {
+				lastProbeErr = fmt.Errorf(
+					"ODoH relay probe via POST and GET failed: POST HTTP status %d: %w; GET HTTP status %d: %w",
+					postStatusCode,
+					postErr,
+					getStatusCode,
+					getErr,
+				)
+				continue
+			}
+			dlog.Debugf("Server [%s] doesn't appear to support POST; falling back to GET requests", name)
+		}
+
+		queryMsg := dohNXTestPacket(0xcafe)
+		odohQuery, err = odohTargetConfig.encryptQuery(queryMsg.Data)
+		if err != nil {
+			lastProbeErr = fmt.Errorf("failed to encrypt ODoH DNS probe: %w", err)
+			continue
+		}
+
+		responseBody, responseCode, tls, rtt, err := proxy.xTransport.ObliviousDoHQuery(
+			useGet,
+			url,
+			odohQuery.odohMessage,
+			proxy.timeout,
+		)
+		if err != nil {
+			lastProbeErr = fmt.Errorf("ODoH DNS probe failed with HTTP status %d: %w", responseCode, err)
+			continue
+		}
+		if responseCode == 401 {
+			return ServerInfo{}, fmt.Errorf("configuration changed during ODoH probe")
+		}
+		if responseCode < 200 || responseCode >= 300 {
+			lastProbeErr = fmt.Errorf("ODoH DNS probe returned HTTP status %d", responseCode)
+			continue
+		}
+		serverResponse, err := odohQuery.decryptResponse(responseBody)
+		if err != nil {
+			dlog.Warnf("Unable to decrypt response from [%v]: [%v]", name, err)
+			lastProbeErr = fmt.Errorf("failed to decrypt ODoH DNS probe response: %w", err)
+			continue
+		}
+		workingConfigs = append(workingConfigs, odohTargetConfig)
+
+		msg := dns.Msg{Data: serverResponse}
+		if err := msg.Unpack(); err != nil {
+			dlog.Warnf("[%s]: %v", name, err)
+			return ServerInfo{}, err
+		}
+		if err := validateResponseForQuery(queryMsg, &msg); err != nil {
+			return ServerInfo{}, err
+		}
+		if msg.Rcode != dns.RcodeNameError {
+			return ServerInfo{}, fmt.Errorf("[%s] may be a lying resolver -- skipping", name)
+		}
+		protocol := "http"
+		tlsVersion := uint16(0)
+		tlsCipherSuite := uint16(0)
+		if tls != nil {
+			protocol = tls.NegotiatedProtocol
+			if len(protocol) == 0 {
+				protocol = "http/1.x"
+			} else {
+				tlsVersion = tls.Version
+				tlsCipherSuite = tls.CipherSuite
+			}
+		}
+		if strings.HasPrefix(protocol, "http/1.") {
+			dlog.Warnf("[%s] does not support HTTP/2", name)
+		}
+		dlog.Infof(
+			"[%s] TLS version: %x - Protocol: %v - Cipher suite: %v",
+			name,
+			tlsVersion,
+			protocol,
+			tlsCipherSuite,
+		)
+		showCerts := proxy.showCerts
+		found := false
+		var wantedHash [32]byte
+		if tls != nil {
+			for _, cert := range tls.PeerCertificates {
+				h := sha256.Sum256(cert.RawTBSCertificate)
+				if showCerts {
+					dlog.Noticef("Advertised relay cert: [%s] [%x]", cert.Subject, h)
+				} else {
+					dlog.Debugf("Advertised relay cert: [%s] [%x]", cert.Subject, h)
+				}
+				for _, hash := range stamp.Hashes {
+					if len(hash) == len(wantedHash) {
+						copy(wantedHash[:], hash)
+						if h == wantedHash {
+							found = true
+							break
+						}
+					}
+				}
+				if found {
+					break
+				}
+			}
+			if !found && len(stamp.Hashes) > 0 {
+				dlog.Criticalf("[%s] Certificate hash [%x] not found", name, wantedHash)
+				return ServerInfo{}, fmt.Errorf("Certificate hash not found")
+			}
+		}
+		if len(serverResponse) < MinDNSPacketSize || len(serverResponse) > MaxDNSPacketSize ||
+			serverResponse[0] != 0xca || serverResponse[1] != 0xfe || serverResponse[4] != 0x00 || serverResponse[5] != 0x01 {
+			dlog.Info("Webserver returned an unexpected response")
+			return ServerInfo{}, errors.New("Webserver returned an unexpected response")
+		}
+		xrtt := int(rtt.Nanoseconds() / 1000000)
+		if isNew {
+			dlog.Noticef("[%s] OK (ODoH) - rtt: %dms", name, xrtt)
+		} else {
+			dlog.Infof("[%s] OK (ODoH) - rtt: %dms", name, xrtt)
+		}
+		return ServerInfo{
+			Proto:             stamps.StampProtoTypeODoHTarget,
+			Name:              name,
+			Timeout:           proxy.timeout,
+			URL:               targetURL,
+			HostName:          stamp.ProviderName,
+			initialRtt:        xrtt,
+			useGet:            useGet,
+			Relay:             relay,
+			odohTargetConfigs: workingConfigs,
+		}, nil
+	}
+	if lastProbeErr != nil {
+		return ServerInfo{}, fmt.Errorf("ODoH initialization probe failed for [%v]: %w", name, lastProbeErr)
+	}
+	return ServerInfo{}, fmt.Errorf("no valid ODoH configuration for [%v]", name)
+}
+
+func fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
+	var err error
+	var serverInfo ServerInfo
+	for i := 0; i < 3; i += 1 {
+		serverInfo, err = _fetchODoHTargetInfo(proxy, name, stamp, isNew)
+		if err == nil {
+			break
+		}
+		if i < 2 {
+			dlog.Infof("Retrying ODoH initialization for [%v] after failure: [%v]", name, err)
+		}
+	}
+	return serverInfo, err
 }
 
 func (serverInfo *ServerInfo) noticeFailure(proxy *Proxy) {

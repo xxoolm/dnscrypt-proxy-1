@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,9 +14,9 @@ import (
 	"time"
 
 	"github.com/hectane/go-acl"
-	"github.com/powerman/check"
-
+	"github.com/jedisct1/dlog"
 	"github.com/jedisct1/go-minisign"
+	"github.com/powerman/check"
 )
 
 type SourceFixture struct {
@@ -40,7 +39,7 @@ const (
 	TestStateReadSigErr                        // I/O error on reading .minisig (download only)
 	TestStateOpenErr                           // I/O error on opening files
 	TestStateOpenSigErr                        // I/O error on opening .minisig
-	TestStatePathErr                           // unparseable path to files (download only)
+	TestStatePathErr                           // unparsable path to files (download only)
 )
 
 type SourceTestData struct {
@@ -69,7 +68,7 @@ type SourceTestExpect struct {
 }
 
 func readFixture(t *testing.T, name string) []byte {
-	bin, err := ioutil.ReadFile(filepath.Join("testdata", name))
+	bin, err := os.ReadFile(filepath.Join("testdata", name))
 	if err != nil {
 		t.Fatalf("Unable to read test fixture %s: %v", name, err)
 	}
@@ -84,9 +83,9 @@ func writeSourceCache(t *testing.T, e *SourceTestExpect) {
 		path := e.cachePath + f.suffix
 		perms := f.perms
 		if perms == 0 {
-			perms = 0644
+			perms = 0o644
 		}
-		if err := ioutil.WriteFile(path, f.content, perms); err != nil {
+		if err := os.WriteFile(path, f.content, perms); err != nil {
 			t.Fatalf("Unable to write cache file %s: %v", path, err)
 		}
 		if err := acl.Chmod(path, perms); err != nil {
@@ -108,8 +107,8 @@ func writeSourceCache(t *testing.T, e *SourceTestExpect) {
 func checkSourceCache(c *check.C, e *SourceTestExpect) {
 	for _, f := range e.cache {
 		path := e.cachePath + f.suffix
-		_ = acl.Chmod(path, 0644) // don't worry if this fails, reading it will catch the same problem
-		got, err := ioutil.ReadFile(path)
+		_ = acl.Chmod(path, 0o644) // don't worry if this fails, reading it will catch the same problem
+		got, err := os.ReadFile(path)
 		c.DeepEqual(got, f.content, "Unexpected content for cache file '%s', err %v", path, err)
 		if f.suffix != "" {
 			continue
@@ -134,7 +133,7 @@ func loadSnakeoil(t *testing.T, d *SourceTestData) {
 }
 
 func loadTestSourceNames(t *testing.T, d *SourceTestData) {
-	files, err := ioutil.ReadDir(filepath.Join("testdata", "sources"))
+	files, err := os.ReadDir(filepath.Join("testdata", "sources"))
 	if err != nil {
 		t.Fatalf("Unable to load list of test sources: %v", err)
 	}
@@ -145,7 +144,7 @@ func loadTestSourceNames(t *testing.T, d *SourceTestData) {
 	}
 }
 
-func generateFixtureState(t *testing.T, d *SourceTestData, suffix, file string, state SourceTestState) {
+func generateFixtureState(_ *testing.T, d *SourceTestData, suffix, file string, state SourceTestState) {
 	if _, ok := d.fixtures[state]; !ok {
 		d.fixtures[state] = map[string]SourceFixture{}
 	}
@@ -165,7 +164,7 @@ func generateFixtureState(t *testing.T, d *SourceTestData, suffix, file string, 
 	case TestStateReadErr, TestStateReadSigErr:
 		f.content, f.length = []byte{}, "1"
 	case TestStateOpenErr, TestStateOpenSigErr:
-		f.content, f.perms = d.fixtures[TestStateCorrect][file].content[:1], 0200
+		f.content, f.perms = d.fixtures[TestStateCorrect][file].content[:1], 0o200
 	}
 	d.fixtures[state][file] = f
 }
@@ -196,7 +195,7 @@ func loadFixtures(t *testing.T, d *SourceTestData) {
 }
 
 func makeTempDir(t *testing.T, d *SourceTestData) {
-	name, err := ioutil.TempDir("", "sources_test.go."+t.Name())
+	name, err := os.MkdirTemp("", "sources_test.go."+t.Name())
 	if err != nil {
 		t.Fatalf("Unable to create temporary directory: %v", err)
 	}
@@ -285,9 +284,9 @@ func prepSourceTestCache(t *testing.T, d *SourceTestData, e *SourceTestExpect, s
 	e.cache = []SourceFixture{d.fixtures[state][source], d.fixtures[state][source+".minisig"]}
 	switch state {
 	case TestStateCorrect:
-		e.Source.in, e.success = e.cache[0].content, true
+		e.Source.bin, e.success = e.cache[0].content, true
 	case TestStateExpired:
-		e.Source.in = e.cache[0].content
+		e.Source.bin = e.cache[0].content
 	case TestStatePartial, TestStatePartialSig:
 		e.err = "signature"
 	case TestStateMissing, TestStateMissingSig, TestStateOpenErr, TestStateOpenSigErr:
@@ -296,7 +295,13 @@ func prepSourceTestCache(t *testing.T, d *SourceTestData, e *SourceTestExpect, s
 	writeSourceCache(t, e)
 }
 
-func prepSourceTestDownload(t *testing.T, d *SourceTestData, e *SourceTestExpect, source string, downloadTest []SourceTestState) {
+func prepSourceTestDownload(
+	_ *testing.T,
+	d *SourceTestData,
+	e *SourceTestExpect,
+	source string,
+	downloadTest []SourceTestState,
+) {
 	if len(downloadTest) == 0 {
 		return
 	}
@@ -313,7 +318,11 @@ func prepSourceTestDownload(t *testing.T, d *SourceTestData, e *SourceTestExpect
 		case TestStateOpenErr, TestStateOpenSigErr:
 			if u, err := url.Parse(serverURL + path); err == nil {
 				host, port := ExtractHostAndPort(u.Host, -1)
-				u.Host = fmt.Sprintf("%s:%d", host, port|0x10000) // high numeric port is parsed but then fails to connect
+				u.Host = fmt.Sprintf(
+					"%s:%d",
+					host,
+					port|0x10000,
+				) // high numeric port is parsed but then fails to connect
 				serverURL = u.String()
 			}
 			e.err = "invalid port"
@@ -330,7 +339,7 @@ func prepSourceTestDownload(t *testing.T, d *SourceTestData, e *SourceTestExpect
 		switch state {
 		case TestStateCorrect:
 			e.cache = []SourceFixture{d.fixtures[state][source], d.fixtures[state][source+".minisig"]}
-			e.Source.in, e.success = e.cache[0].content, true
+			e.Source.bin, e.success = e.cache[0].content, true
 			fallthrough
 		case TestStateMissingSig, TestStatePartial, TestStatePartialSig, TestStateReadSigErr:
 			d.reqExpect[path+".minisig"]++
@@ -341,7 +350,7 @@ func prepSourceTestDownload(t *testing.T, d *SourceTestData, e *SourceTestExpect
 	}
 	if e.success {
 		e.err = ""
-		e.delay = DefaultPrefetchDelay
+		e.delay = DefaultPrefetchDelay * 3 // matches cacheTTL/prefetchDelay set in setupSourceTestCase
 	} else {
 		e.delay = MinimumPrefetchInterval
 	}
@@ -353,23 +362,30 @@ func prepSourceTestDownload(t *testing.T, d *SourceTestData, e *SourceTestExpect
 }
 
 func setupSourceTestCase(t *testing.T, d *SourceTestData, i int,
-	cacheTest *SourceTestState, downloadTest []SourceTestState) (id string, e *SourceTestExpect) {
+	cacheTest *SourceTestState, downloadTest []SourceTestState,
+) (id string, e *SourceTestExpect) {
 	id = strconv.Itoa(d.n) + "-" + strconv.Itoa(i)
 	e = &SourceTestExpect{
 		cachePath: filepath.Join(d.tempDir, id),
 		mtime:     d.timeNow,
 	}
-	e.Source = &Source{name: id, urls: []*url.URL{}, format: SourceFormatV2, minisignKey: d.key,
-		cacheFile: e.cachePath, cacheTTL: DefaultPrefetchDelay * 3, prefetchDelay: DefaultPrefetchDelay}
+	e.Source = &Source{
+		name: id, urls: []*url.URL{}, format: SourceFormatV2, minisignKey: d.key,
+		cacheFile: e.cachePath, cacheTTL: DefaultPrefetchDelay * 3, prefetchDelay: DefaultPrefetchDelay * 3,
+	}
 	if cacheTest != nil {
 		prepSourceTestCache(t, d, e, d.sources[i], *cacheTest)
 		i = (i + 1) % len(d.sources) // make the cached and downloaded fixtures different
 	}
 	prepSourceTestDownload(t, d, e, d.sources[i], downloadTest)
-	return
+	return id, e
 }
 
 func TestNewSource(t *testing.T) {
+	if testing.Verbose() {
+		dlog.SetLogLevel(dlog.SeverityDebug)
+		dlog.UseSyslog(false)
+	}
 	teardown, d := setupSourceTest(t)
 	defer teardown()
 	checkResult := func(t *testing.T, e *SourceTestExpect, got *Source, err error) {
@@ -385,16 +401,26 @@ func TestNewSource(t *testing.T) {
 	}
 	d.n++
 	for _, tt := range []struct {
-		v, key       string
-		refreshDelay time.Duration
-		e            *SourceTestExpect
+		v, key                 string
+		refreshDelay, cacheTTL time.Duration
+		e                      *SourceTestExpect
 	}{
-		{"", "", 0, &SourceTestExpect{err: " ", Source: &Source{name: "short refresh delay", urls: []*url.URL{}, cacheTTL: DefaultPrefetchDelay, prefetchDelay: DefaultPrefetchDelay, prefix: ""}}},
-		{"v1", d.keyStr, DefaultPrefetchDelay * 2, &SourceTestExpect{err: "Unsupported source format", Source: &Source{name: "old format", urls: []*url.URL{}, cacheTTL: DefaultPrefetchDelay * 2, prefetchDelay: DefaultPrefetchDelay}}},
-		{"v2", "", DefaultPrefetchDelay * 3, &SourceTestExpect{err: "Invalid encoded public key", Source: &Source{name: "invalid public key", urls: []*url.URL{}, cacheTTL: DefaultPrefetchDelay * 3, prefetchDelay: DefaultPrefetchDelay}}},
+		{"", "", 0, 0, &SourceTestExpect{err: " ", Source: &Source{name: "short refresh delay", urls: []*url.URL{}, cacheTTL: DefaultPrefetchDelay, prefetchDelay: DefaultPrefetchDelay, prefix: ""}}},
+		{"v1", d.keyStr, DefaultPrefetchDelay * 2, DefaultPrefetchDelay * 2, &SourceTestExpect{err: "Unsupported source format", Source: &Source{name: "old format", urls: []*url.URL{}, cacheTTL: DefaultPrefetchDelay * 2, prefetchDelay: DefaultPrefetchDelay * 2}}},
+		{"v2", "", DefaultPrefetchDelay * 3, DefaultPrefetchDelay * 3, &SourceTestExpect{err: "Invalid encoded public key", Source: &Source{name: "invalid public key", urls: []*url.URL{}, cacheTTL: DefaultPrefetchDelay * 3, prefetchDelay: DefaultPrefetchDelay * 3}}},
 	} {
 		t.Run(tt.e.Source.name, func(t *testing.T) {
-			got, err := NewSource(tt.e.Source.name, d.xTransport, tt.e.urls, tt.key, tt.e.cachePath, tt.v, tt.refreshDelay, tt.e.prefix)
+			got, err := NewSource(
+				tt.e.Source.name,
+				d.xTransport,
+				tt.e.urls,
+				tt.key,
+				tt.e.cachePath,
+				tt.v,
+				tt.refreshDelay,
+				tt.cacheTTL,
+				tt.e.prefix,
+			)
 			checkResult(t, tt.e, got, err)
 		})
 	}
@@ -404,7 +430,17 @@ func TestNewSource(t *testing.T) {
 			for i := range d.sources {
 				id, e := setupSourceTestCase(t, d, i, &cacheTest, downloadTest)
 				t.Run("cache "+cacheTestName+", download "+downloadTestName+"/"+id, func(t *testing.T) {
-					got, err := NewSource(id, d.xTransport, e.urls, d.keyStr, e.cachePath, "v2", DefaultPrefetchDelay*3, "")
+					got, err := NewSource(
+						id,
+						d.xTransport,
+						e.urls,
+						d.keyStr,
+						e.cachePath,
+						"v2",
+						DefaultPrefetchDelay*3,
+						DefaultPrefetchDelay*3,
+						"",
+					)
 					checkResult(t, e, got, err)
 				})
 			}
@@ -413,6 +449,10 @@ func TestNewSource(t *testing.T) {
 }
 
 func TestPrefetchSources(t *testing.T) {
+	if testing.Verbose() {
+		dlog.SetLogLevel(dlog.SeverityDebug)
+		dlog.UseSyslog(false)
+	}
 	teardown, d := setupSourceTest(t)
 	defer teardown()
 	checkResult := func(t *testing.T, expects []*SourceTestExpect, got time.Duration) {
@@ -437,9 +477,18 @@ func TestPrefetchSources(t *testing.T) {
 		for i := range d.sources {
 			_, e := setupSourceTestCase(t, d, i, nil, downloadTest)
 			e.mtime = d.timeUpd
-			s := &Source{}
-			*s = *e.Source
-			s.in = nil
+			s := &Source{
+				name:          e.Source.name,
+				urls:          e.Source.urls,
+				format:        e.Source.format,
+				minisignKey:   e.Source.minisignKey,
+				cacheFile:     e.Source.cacheFile,
+				cacheTTL:      e.Source.cacheTTL,
+				prefetchDelay: e.Source.prefetchDelay,
+				refresh:       d.timeUpd, // Set to trigger prefetch (source.refresh.After(now) will be false)
+				prefix:        e.Source.prefix,
+				// bin is intentionally left nil
+			}
 			sources = append(sources, s)
 			expects = append(expects, e)
 		}

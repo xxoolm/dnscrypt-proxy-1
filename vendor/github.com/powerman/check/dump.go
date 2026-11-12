@@ -9,10 +9,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/pmezard/go-difflib/difflib"
+	"github.com/powerman/check/internal/difflib"
+	"github.com/powerman/check/internal/spew"
 )
 
+//nolint:gochecknoglobals // Const.
 var spewCfg = spew.ConfigState{
 	Indent:                  "  ",
 	DisablePointerAddresses: true,
@@ -63,10 +64,11 @@ func (v dump) diff(expected dump) string {
 // - string: use this instead of quoted single-line:
 //   - valid utf8: don't quote ", show multiline strings on separate lines
 //   - invalid utf8: use hexdump like for []byte
+//
 // - []byte: same as string instead of hexdump for valid utf8
 // - []rune: use quoted char instead of number for valid runes in list
-// - json.RawMessage: indent, then same as string
-func newDump(i interface{}) (d dump) { // nolint:gocyclo,gocognit,funlen
+// - [json.RawMessage]: indent, then same as string.
+func newDump(i any) (d dump) { //nolint:gocyclo,gocognit,funlen,cyclop // By design.
 	d.dump = spewCfg.Sdump(i)
 
 	if i == nil {
@@ -77,7 +79,7 @@ func newDump(i interface{}) (d dump) { // nolint:gocyclo,gocognit,funlen
 	val := reflect.ValueOf(i)
 	typ := reflect.TypeOf(i)
 	kind := typ.Kind()
-	if kind == reflect.Ptr {
+	if kind == reflect.Pointer {
 		if val.IsNil() {
 			return d
 		}
@@ -88,19 +90,33 @@ func newDump(i interface{}) (d dump) { // nolint:gocyclo,gocognit,funlen
 	d.indirectType = typ
 
 	switch {
-	case typ == reflect.TypeOf(json.RawMessage(nil)):
+	case typ == reflect.TypeFor[json.RawMessage]():
 		v := val.Bytes()
 		var buf bytes.Buffer
 		if json.Indent(&buf, v, "", "  ") == nil {
-			d.dump = fmt.Sprintf("(%T) (len=%d) '\n%s\n'\n", i, len(v), buf.String())
+			// Go 1.27 made json.RawMessage an alias for jsontext.Value, so %T
+			// would print "jsontext.Value" there instead of "json.RawMessage".
+			// Use a hardcoded name to keep dump output identical across Go versions
+			// (this also covers a directly used jsontext.Value, which is the exact
+			// same type as json.RawMessage on Go 1.27).
+			//
+			// Once support for Go 1.26 is dropped, it would make more sense to
+			// rename this to "jsontext.Value"/"*jsontext.Value", since that's the
+			// name Go itself now treats as canonical (encoding/json/jsontext only
+			// exists once GOEXPERIMENT=jsonv2 is the default, i.e. Go 1.27+).
+			name := "json.RawMessage"
+			if reflect.TypeOf(i).Kind() == reflect.Pointer {
+				name = "*json.RawMessage"
+			}
+			d.dump = fmt.Sprintf("(%s) (len=%d) '\n%s\n'\n", name, len(v), buf.String())
 		}
 
 	case kind == reflect.Uint8:
-		v := byte(val.Uint())
+		v := byte(val.Uint()) //nolint:gosec // False positive.
 		d.dump = fmt.Sprintf("(%T) 0x%02X\n", i, v)
 
 	case kind == reflect.Int32:
-		v := rune(val.Int())
+		v := rune(val.Int()) //nolint:gosec // False positive.
 		if utf8.ValidRune(v) {
 			d.dump = fmt.Sprintf("(%T) %q\n", i, v)
 		}
@@ -108,7 +124,7 @@ func newDump(i interface{}) (d dump) { // nolint:gocyclo,gocognit,funlen
 	case kind == reflect.Slice && typ.Elem().Kind() == reflect.Int32:
 		valid := true
 		for k := 0; k < val.Len() && valid; k++ {
-			valid = valid && utf8.ValidRune(rune(val.Index(k).Int()))
+			valid = valid && utf8.ValidRune(rune(val.Index(k).Int())) //nolint:gosec // False positive.
 		}
 		if valid {
 			d.dump = fmt.Sprintf("(%T) %q\n", i, i)

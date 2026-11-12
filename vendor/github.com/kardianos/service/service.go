@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // Package service provides a simple way to create a system service.
-// Currently supports Windows, Linux/(systemd | Upstart | SysV), and OSX/Launchd.
+// Currently supports Windows, Linux/(systemd | Upstart | SysV | OpenRC), and OSX/Launchd.
 //
 // Windows controls services by setting up callbacks that is non-trivial. This
 // is very different then other systems. This package provides the same API
@@ -91,8 +91,12 @@ const (
 
 	optionSystemdScript = "SystemdScript"
 	optionSysvScript    = "SysvScript"
+	optionRCSScript     = "RCSScript"
 	optionUpstartScript = "UpstartScript"
 	optionLaunchdConfig = "LaunchdConfig"
+	optionOpenRCScript  = "OpenRCScript"
+
+	optionLogDirectory = "LogDirectory"
 )
 
 // Status represents service status as an byte value
@@ -132,29 +136,9 @@ type Config struct {
 	ChRoot           string
 
 	// System specific options.
-	//  * OS X
-	//    - LaunchdConfig string ()      - Use custom launchd config
-	//    - KeepAlive     bool   (true)
-	//    - RunAtLoad     bool   (false)
-	//    - UserService   bool   (false) - Install as a current user service.
-	//    - SessionCreate bool   (false) - Create a full user session.
-	//  * POSIX
-	//    - SystemdScript string ()                 - Use custom systemd script
-	//    - UpstartScript string ()                 - Use custom upstart script
-	//    - SysvScript    string ()                 - Use custom sysv script
-	//    - RunWait       func() (wait for SIGNAL)  - Do not install signal but wait for this function to return.
-	//    - ReloadSignal  string () [USR1, ...]     - Signal to send on reaload.
-	//    - PIDFile       string () [/run/prog.pid] - Location of the PID file.
-	//    - LogOutput     bool   (false)            - Redirect StdErr & StandardOutPath to files.
-	//    - Restart       string (always)           - How shall service be restarted.
-	//    - SuccessExitStatus string ()             - The list of exit status that shall be considered as successful,
-	//                                                in addition to the default ones.
-	//  * Linux (systemd)
-	//    - LimitNOFILE	 int - Maximum open files (ulimit -n) (https://serverfault.com/questions/628610/increasing-nproc-for-processes-launched-by-systemd-on-centos-7)
-	//  * Windows
-	//    - DelayedAutoStart  bool (false) - after booting start this service after some delay
-
 	Option KeyValue
+
+	EnvVars map[string]string
 }
 
 var (
@@ -167,7 +151,7 @@ var (
 	ErrNameFieldRequired = errors.New("Config.Name field is required.")
 	// ErrNoServiceSystemDetected is returned when no system was detected.
 	ErrNoServiceSystemDetected = errors.New("No service system detected.")
-	// ErrNotInstalled is returned when the service is not installed
+	// ErrNotInstalled is returned when the service is not installed.
 	ErrNotInstalled = errors.New("the service is not installed")
 )
 
@@ -182,8 +166,118 @@ func New(i Interface, c *Config) (Service, error) {
 	return system.New(i, c)
 }
 
-// KeyValue provides a list of platform specific options. See platform docs for
-// more details.
+// KeyValue provides a list of system specific options.
+//
+//   - OS X
+//
+//   - LaunchdConfig string ()                 - Use custom launchd config.
+//
+//   - KeepAlive     bool   (true)             - Prevent the system from stopping the service automatically.
+//
+//   - RunAtLoad     bool   (false)            - Run the service after its job has been loaded.
+//
+//   - SessionCreate bool   (false)            - Create a full user session.
+//
+//   - Solaris
+//
+//   - Prefix        string ("application")    - Service FMRI prefix.
+//
+//   - POSIX
+//
+//   - UserService   bool   (false)            - Install as a current user service.
+//
+//   - SystemdScript string ()                 - Use custom systemd script.
+//
+//   - UpstartScript string ()                 - Use custom upstart script.
+//
+//   - SysvScript    string ()                 - Use custom sysv script.
+//
+//   - OpenRCScript  string ()                 - Use custom OpenRC script.
+//
+//   - RunWait       func() (wait for SIGNAL)  - Do not install signal but wait for this function to return.
+//
+//   - ReloadSignal  string () [USR1, ...]     - Signal to send on reload.
+//
+//   - PIDFile       string () [/run/prog.pid] - Location of the PID file.
+//
+//   - LogOutput     bool   (false)            - Redirect StdErr & StandardOutPath to files.
+//
+//   - Restart       string (always)           - How shall service be restarted.
+//
+//   - SuccessExitStatus string ()             - The list of exit status that shall be considered as successful,
+//     in addition to the default ones.
+//
+//   - LogDirectory string(/var/log)           - The path to the log files directory
+//
+//   - Linux (systemd)
+//
+//   - LimitNOFILE   int    (-1)               - Maximum open files (ulimit -n)
+//     (https://serverfault.com/questions/628610/increasing-nproc-for-processes-launched-by-systemd-on-centos-7)
+//
+//   - Windows
+//
+//   - DelayedAutoStart  bool (false)                - After booting, start this service after some delay.
+//
+//   - Password  string ()                           - Password to use when interfacing with the system service manager.
+//
+//   - Interactive       bool (false)                - The service can interact with the desktop. (more information https://docs.microsoft.com/en-us/windows/win32/services/interactive-services)
+//
+//   - DelayedAutoStart        bool (false)          - after booting start this service after some delay.
+//
+//   - StartType               string ("automatic")  - Start service type. (automatic | manual | disabled)
+//
+//   - OnFailure               string ("restart" )   - Action to perform on service failure. (restart | reboot | noaction)
+//
+//   - OnFailureDelayDuration  string ( "1s" )       - Delay before restarting the service, time.Duration string.
+//
+//   - OnFailureResetPeriod    int ( 10 )            - Reset period for errors, seconds.
+//
+// # Custom service-file templates
+//
+// The LaunchdConfig, SystemdScript, UpstartScript, SysvScript, RCSScript, and
+// OpenRCScript options each supply a template used to render the service file
+// in place of the built-in one. Set one by placing the template string in
+// Config.Option under the matching key:
+//
+//	c := &service.Config{
+//		Name: "myservice",
+//		Option: service.KeyValue{
+//			"SystemdScript": myScript, // template string, syntax below
+//		},
+//	}
+//
+// SysvScript is also the key read by the procd, AIX, FreeBSD, and Solaris
+// backends; the key set available to a custom script is whatever the active
+// init system passes (see below).
+//
+// Templates are rendered by a small built-in engine (not text/template). The
+// supported actions are:
+//
+//   - {{Key}}                       substitute a value.
+//   - {{Key | fn | fn}}             substitute, piped through function(s).
+//   - {{if Key}}…{{end}}            include the body when Key is non-empty.
+//   - {{if Key}}…{{else}}…{{end}}   with an else branch.
+//   - {{range Key}}…{{.}}…{{end}}   repeat the body once per item of a list
+//     value, with {{.}} bound to the current item.
+//   - {{- …}} and {{… -}}          trim whitespace before or after the action.
+//
+// Every value is a string or a list of strings; a list is also truthy in
+// {{if}} when non-empty. There is no dotted field access and no arithmetic or
+// boolean functions — any such logic is resolved before rendering. The exact
+// keys and pipeline functions available for a given platform are precisely
+// those used by that platform's default template, so read the corresponding
+// source constant to see them: launchdConfig (darwin), systemdScript,
+// upstartScript, sysvScript, rcsScript, openRCScript, procdScript, svcConfig
+// (AIX), rcScript (FreeBSD), and manifest (Solaris).
+//
+// Compatibility: earlier versions parsed these options with the standard
+// library text/template. Custom scripts written for that engine — using dotted
+// fields such as {{.Name}}, the and/or/not/eq/gt functions, or method calls —
+// must be rewritten in the syntax above; they will otherwise fail to render
+// with an "unknown template key" error. text/template was removed because it
+// reaches reflect.Value.MethodByName, which forces the linker into a
+// conservative mode that defeats dead-code elimination and substantially
+// inflates binaries importing this package.
 type KeyValue map[string]interface{}
 
 // bool returns the value of the given name, assuming the value is a boolean.
@@ -306,16 +400,16 @@ type System interface {
 // Interface represents the service interface for a program. Start runs before
 // the hosting process is granted control and Stop runs when control is returned.
 //
-//   1. OS service manager executes user program.
-//   2. User program sees it is executed from a service manager (IsInteractive is false).
-//   3. User program calls Service.Run() which blocks.
-//   4. Interface.Start() is called and quickly returns.
-//   5. User program runs.
-//   6. OS service manager signals the user program to stop.
-//   7. Interface.Stop() is called and quickly returns.
-//      - For a successful exit, os.Exit should not be called in Interface.Stop().
-//   8. Service.Run returns.
-//   9. User program should quickly exit.
+//  1. OS service manager executes user program.
+//  2. User program sees it is executed from a service manager (IsInteractive is false).
+//  3. User program calls Service.Run() which blocks.
+//  4. Interface.Start() is called and quickly returns.
+//  5. User program runs.
+//  6. OS service manager signals the user program to stop.
+//  7. Interface.Stop() is called and quickly returns.
+//     - For a successful exit, os.Exit should not be called in Interface.Stop().
+//  8. Service.Run returns.
+//  9. User program should quickly exit.
 type Interface interface {
 	// Start provides a place to initiate the service. The service doesn't
 	// signal a completed start until after this function returns, so the

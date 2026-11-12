@@ -6,6 +6,7 @@ package service
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -13,6 +14,8 @@ import (
 )
 
 var cgroupFile = "/proc/1/cgroup"
+var mountInfoFile = "/proc/self/mountinfo"
+var dockerEnvFile = "/.dockerenv"
 
 type linuxSystemService struct {
 	name        string
@@ -54,6 +57,33 @@ func init() {
 			new: newUpstartService,
 		},
 		linuxSystemService{
+			name:   "linux-openrc",
+			detect: isOpenRC,
+			interactive: func() bool {
+				is, _ := isInteractive()
+				return is
+			},
+			new: newOpenRCService,
+		},
+		linuxSystemService{
+			name:   "linux-rcs",
+			detect: isRCS,
+			interactive: func() bool {
+				is, _ := isInteractive()
+				return is
+			},
+			new: newRCSService,
+		},
+		linuxSystemService{
+			name:   "linux-procd",
+			detect: isProcd,
+			interactive: func() bool {
+				is, _ := isInteractive()
+				return is
+			},
+			new: newProcdService,
+		},
+		linuxSystemService{
 			name:   "unix-systemv",
 			detect: func() bool { return true },
 			interactive: func() bool {
@@ -80,7 +110,7 @@ func binaryName(pid int) (string, error) {
 }
 
 func isInteractive() (bool, error) {
-	inContainer, err := isInContainer(cgroupFile)
+	inContainer, err := isInContainer()
 	if err != nil {
 		return false, err
 	}
@@ -100,7 +130,62 @@ func isInteractive() (bool, error) {
 
 // isInContainer checks if the service is being executed in docker or lxc
 // container.
-func isInContainer(cgroupPath string) (bool, error) {
+func isInContainer() (bool, error) {
+	inContainer, err := isInContainerDockerEnv(dockerEnvFile)
+	if err != nil {
+		return false, err
+	}
+	if inContainer {
+		return true, nil
+	}
+
+	inContainer, err = isInContainerCGroup(cgroupFile)
+	if err != nil {
+		return false, err
+	}
+	if inContainer {
+		return true, nil
+	}
+
+	return isInContainerMountInfo(mountInfoFile)
+}
+
+func isInContainerDockerEnv(filePath string) (bool, error) {
+	_, err := os.Stat(filePath)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	return false, err
+}
+
+func isInContainerMountInfo(filePath string) (bool, error) {
+	const maxlines = 15 // maximum lines to scan
+	f, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	scan := bufio.NewScanner(f)
+
+	lines := 0
+	for scan.Scan() && !(lines > maxlines) {
+		if strings.Contains(scan.Text(), "/docker/containers") {
+			return true, nil
+		}
+		lines++
+	}
+	if err := scan.Err(); err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
+func isInContainerCGroup(cgroupPath string) (bool, error) {
 	const maxlines = 5 // maximum lines to scan
 
 	f, err := os.Open(cgroupPath)
@@ -124,11 +209,19 @@ func isInContainer(cgroupPath string) (bool, error) {
 	return false, nil
 }
 
-var tf = map[string]interface{}{
-	"cmd": func(s string) string {
-		return `"` + strings.Replace(s, `"`, `\"`, -1) + `"`
-	},
-	"cmdEscape": func(s string) string {
-		return strings.Replace(s, " ", `\x20`, -1)
-	},
+// cmdQuote and cmdEscape are the plain string transforms used when building
+// service files. They are also exposed to custom user templates through tfs.
+func cmdQuote(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+func cmdEscape(s string) string {
+	return strings.ReplaceAll(s, " ", `\x20`)
+}
+
+// tfs is the string-only function map for the mini template engine, exposing
+// the cmd/cmdEscape pipeline functions to the built-in and custom templates.
+var tfs = map[string]tmplFunc{
+	"cmd":       func(s string) (string, error) { return cmdQuote(s), nil },
+	"cmdEscape": func(s string) (string, error) { return cmdEscape(s), nil },
 }

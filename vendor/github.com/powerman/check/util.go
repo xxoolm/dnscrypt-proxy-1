@@ -3,34 +3,29 @@ package check
 import (
 	"fmt"
 	"math"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 )
 
-func callerTestFileLines() (file string, line int, funcLine int) {
-	pc, file, line, ok := runtime.Caller(0)
-	myfile := file
-	for stack := 1; ok && samePackage(myfile, file); stack++ {
-		pc, file, line, ok = runtime.Caller(stack)
-	}
-	if f := runtime.FuncForPC(pc); f != nil {
-		_, funcLine = f.FileLine(f.Entry())
-	}
-	return file, line, funcLine
-}
-
-func samePackage(basefile, file string) bool {
-	return filepath.Dir(basefile) == filepath.Dir(file) && !strings.HasSuffix(file, "_test.go")
-}
-
+// callerFuncName returns the unqualified checker name for the caller
+// at the given stack depth, stripping any "(*Receiver)." prefix.
+// Checker methods currently live on *checks,
+// but strip generically rather than pinning to one receiver type,
+// since report0/1/2/3 are also reachable through *TB (Error/Errorf/Fatal/Fatalf)
+// and *C (their delegators).
 func callerFuncName(stack int) string {
 	pc, _, _, _ := runtime.Caller(stack + 1)
-	return strings.TrimPrefix(funcNameAt(pc), "(*C).")
+	name := funcNameAt(pc)
+	if strings.HasPrefix(name, "(*") {
+		if i := strings.Index(name, ")."); i != -1 {
+			name = name[i+2:]
+		}
+	}
+	return name
 }
 
-func funcName(f interface{}) string {
+func funcName(f any) string {
 	return funcNameAt(reflect.ValueOf(f).Pointer())
 }
 
@@ -48,7 +43,7 @@ func funcNameAt(pc uintptr) string {
 	return name
 }
 
-func format(msg ...interface{}) string {
+func format(msg ...any) string {
 	if len(msg) > 1 {
 		return fmt.Sprintf(msg[0].(string), msg[1:]...)
 	}

@@ -1,9 +1,10 @@
 package check
 
 import (
+	"cmp"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -50,10 +51,13 @@ func (c testStat) String() string {
 	return fmt.Sprintf("checks:  %s  %s  %s\t%s", c.passed, c.forged, c.failed, c.name)
 }
 
-var statsMu sync.Mutex
-var stats = map[*testing.T]*testStat{}
+//nolint:gochecknoglobals // By design.
+var (
+	statsMu sync.Mutex
+	stats   = make(map[testing.TB]*testStat)
+)
 
-// Report output statistics about passed/failed checks.
+// Report output statistics about passed/failed checks to stderr.
 // It should be called from TestMain after m.Run(), for ex.:
 //
 //	func TestMain(m *testing.M) {
@@ -63,12 +67,15 @@ var stats = map[*testing.T]*testStat{}
 //	}
 //
 // If this is all you need - just use TestMain instead.
+//
+// Using stderr ensures the output does not interfere with
+// `go test -json` (which expects only valid JSON on stdout).
 func Report() {
 	statsMu.Lock()
 	defer statsMu.Unlock()
 
 	total := newTestStat("(total)", true)
-	ts := make([]*testing.T, 0, len(stats))
+	ts := make([]testing.TB, 0, len(stats))
 	for t := range stats {
 		ts = append(ts, t)
 		total.passed.value += stats[t].passed.value
@@ -81,23 +88,29 @@ func Report() {
 	total.failed.size = digits(total.failed.value)
 
 	if testing.Verbose() {
-		sort.Slice(ts, func(a, b int) bool { return ts[a].Name() < ts[b].Name() })
+		slices.SortFunc(ts, func(a, b testing.TB) int { //nolint:thelper // False positive.
+			return cmp.Compare(a.Name(), b.Name())
+		})
 		for _, t := range ts {
 			stats[t].passed.size = total.passed.size
 			stats[t].forged.size = total.forged.size
 			stats[t].failed.size = total.failed.size
-			fmt.Printf("  %s\n", stats[t])
+			fmt.Fprintf(os.Stderr, "  %s\n", stats[t])
 		}
 	}
-	fmt.Printf("  %s\n", total)
+	fmt.Fprintf(os.Stderr, "  %s\n", total)
 }
 
 // TestMain provides same default implementation as used by testing
-// package with extra Report call to output statistics. Usage:
+// package with extra Report call to output statistics to stderr.
+// Usage:
 //
 //	func TestMain(m *testing.M) { check.TestMain(m) }
+//
+// Using stderr ensures the statistics output does not interfere with
+// `go test -json` (which expects only valid JSON on stdout).
 func TestMain(m *testing.M) {
 	code := m.Run()
 	Report()
-	os.Exit(code)
+	os.Exit(code) //nolint:revive // By design.
 }

@@ -62,7 +62,15 @@ func parseTimeRanges(timeRangesStr []TimeRangeStr) ([]TimeRange, error) {
 
 func parseWeeklyRanges(weeklyRangesStr WeeklyRangesStr) (WeeklyRanges, error) {
 	weeklyRanges := WeeklyRanges{}
-	weeklyRangesStrX := [7][]TimeRangeStr{weeklyRangesStr.Sun, weeklyRangesStr.Mon, weeklyRangesStr.Tue, weeklyRangesStr.Wed, weeklyRangesStr.Thu, weeklyRangesStr.Fri, weeklyRangesStr.Sat}
+	weeklyRangesStrX := [7][]TimeRangeStr{
+		weeklyRangesStr.Sun,
+		weeklyRangesStr.Mon,
+		weeklyRangesStr.Tue,
+		weeklyRangesStr.Wed,
+		weeklyRangesStr.Thu,
+		weeklyRangesStr.Fri,
+		weeklyRangesStr.Sat,
+	}
 	for day, weeklyRangeStrX := range weeklyRangesStrX {
 		timeRanges, err := parseTimeRanges(weeklyRangeStrX)
 		if err != nil {
@@ -85,8 +93,8 @@ func ParseAllWeeklyRanges(allWeeklyRangesStr map[string]WeeklyRangesStr) (*map[s
 	return &allWeeklyRanges, nil
 }
 
-func (weeklyRanges *WeeklyRanges) Match() bool {
-	now := time.Now().Local()
+// Match reports whether a local time falls within the ranges.
+func (weeklyRanges *WeeklyRanges) Match(now time.Time) bool {
 	day := now.Weekday()
 	weeklyRange := weeklyRanges.ranges[day]
 	if len(weeklyRange) == 0 {

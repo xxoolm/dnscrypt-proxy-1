@@ -1,67 +1,57 @@
 ---
-name: "\U0001F41E Issues"
-about: Bug reports
+name: "Bug Report"
+about: Report a bug you've encountered
 title: ''
 labels: ''
 assignees: ''
 
 ---
 
-## Please read before filling a bug report
+Thanks for taking the time to report a bug! Before filing, please note:
 
-This tracker is dedicated to tracking bugs, reproducible in the context described in the
-"Context" section.
+**Need help or have a question?** The issue tracker is for confirmed, reproducible bugs only. For installation help, configuration help, troubleshooting, or general questions, please read the [documentation](https://dnscrypt.info/doc) first. If you still need assistance, use our [Q&A Discussions](https://github.com/DNSCrypt/dnscrypt-proxy/discussions/categories/q-a) instead - you'll likely get a faster response there.
 
-Installation and configuration issues are not bugs, but individual assistance request.
-In order to ask for help, please use the discussions (Q&A) section instead:
-https://github.com/DNSCrypt/dnscrypt-proxy/discussions/categories/q-a
+---
 
-Context: the LATEST version of `dnscrypt-proxy` (precompiled binaries downloaded from this
-repository) is correctly installed and configured on your system, but something doesn't
-seem to produce the expected result.
+### Before submitting
 
-If the bug is not trivial to reproduce on any platform, please include ALL the steps required
-to reliably duplicate it, on a vanilla, generic install of macOS, Windows, OpenBSD or Ubuntu Linux
-system, in their most current version.
+Please make sure:
 
-If you don't have any clear understanding of the issue or can't enumerate the steps to
-reproduce it, open a discussion instead:
-https://github.com/DNSCrypt/dnscrypt-proxy/discussions
+- You've read the [documentation](https://dnscrypt.info/doc) and this is not answered there already
+- You're running the **latest version** of `dnscrypt-proxy` (precompiled binaries from this repository)
+- The software is correctly installed and configured
+- You can reliably reproduce the issue
 
+If the bug requires specific steps to reproduce, please include detailed instructions that would work on a fresh install of macOS, Windows, OpenBSD, or Ubuntu Linux.
 
-## Output of the following commands:
+Not sure if it's a bug? Start a [discussion](https://github.com/DNSCrypt/dnscrypt-proxy/discussions) first - we're happy to help figure it out.
 
+---
+
+## Diagnostic output
+
+Please run these commands and paste the output:
+
+```
 ./dnscrypt-proxy -version
-
 ./dnscrypt-proxy -check
-
 ./dnscrypt-proxy -resolve example.com
+```
 
-
+- [ ] I read the documentation and this is not answered there
 - [ ] Initially raised as discussion #...
 
+## What's happening?
 
+## When does this occur?
 
-## *What* is affected by this bug?
+## Where does it happen?
 
+## How do we replicate the issue?
 
+<!-- Starting from a fresh OS install, what steps trigger this bug? -->
 
-## *When* does this occur?
+## Expected behavior
 
-
-
-## *Where* does it happen?
-
-
-
-## *How* do we replicate the issue?
-<!-- Please list all the steps required to reliably replicate it, starting from a newly installed operating system -->
-
-
-
-## Expected behavior (i.e. solution)
-
-
-
-## Other Comments
+## Additional context
 

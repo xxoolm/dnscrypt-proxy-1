@@ -1,12 +1,13 @@
 package minisign
 
 import (
+	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
-	"io/ioutil"
+	"os"
 	"strings"
 
-	"golang.org/x/crypto/ed25519"
+	"golang.org/x/crypto/blake2b"
 )
 
 type PublicKey struct {
@@ -74,7 +75,7 @@ func DecodeSignature(in string) (Signature, error) {
 
 func NewPublicKeyFromFile(file string) (PublicKey, error) {
 	var publicKey PublicKey
-	bin, err := ioutil.ReadFile(file)
+	bin, err := os.ReadFile(file)
 	if err != nil {
 		return publicKey, err
 	}
@@ -83,7 +84,7 @@ func NewPublicKeyFromFile(file string) (PublicKey, error) {
 
 func NewSignatureFromFile(file string) (Signature, error) {
 	var signature Signature
-	bin, err := ioutil.ReadFile(file)
+	bin, err := os.ReadFile(file)
 	if err != nil {
 		return signature, err
 	}
@@ -91,10 +92,15 @@ func NewSignatureFromFile(file string) (Signature, error) {
 }
 
 func (publicKey *PublicKey) Verify(bin []byte, signature Signature) (bool, error) {
-	if publicKey.SignatureAlgorithm != signature.SignatureAlgorithm {
+	if publicKey.SignatureAlgorithm != [2]byte{'E', 'd'} {
 		return false, errors.New("Incompatible signature algorithm")
 	}
-	if signature.SignatureAlgorithm[0] != 0x45 || signature.SignatureAlgorithm[1] != 0x64 {
+	prehashed := false
+	if signature.SignatureAlgorithm[0] == 0x45 && signature.SignatureAlgorithm[1] == 0x64 {
+		prehashed = false
+	} else if signature.SignatureAlgorithm[0] == 0x45 && signature.SignatureAlgorithm[1] == 0x44 {
+		prehashed = true
+	} else {
 		return false, errors.New("Unsupported signature algorithm")
 	}
 	if publicKey.KeyId != signature.KeyId {
@@ -102,6 +108,12 @@ func (publicKey *PublicKey) Verify(bin []byte, signature Signature) (bool, error
 	}
 	if !strings.HasPrefix(signature.TrustedComment, "trusted comment: ") {
 		return false, errors.New("Unexpected format for the trusted comment")
+	}
+
+	if prehashed {
+		h, _ := blake2b.New512(nil)
+		h.Write(bin)
+		bin = h.Sum(nil)
 	}
 	if !ed25519.Verify(ed25519.PublicKey(publicKey.PublicKey[:]), bin, signature.Signature[:]) {
 		return false, errors.New("Invalid signature")
@@ -113,7 +125,7 @@ func (publicKey *PublicKey) Verify(bin []byte, signature Signature) (bool, error
 }
 
 func (publicKey *PublicKey) VerifyFromFile(file string, signature Signature) (bool, error) {
-	bin, err := ioutil.ReadFile(file)
+	bin, err := os.ReadFile(file)
 	if err != nil {
 		return false, err
 	}
